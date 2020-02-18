@@ -1190,6 +1190,13 @@ static int do_run(mddev_t *mddev)
 			blk_queue_write_cache(gd->queue, true, true);
                         gd->queue->backing_dev_info->ra_pages = (128*1024)/PAGE_SIZE;
 
+                        blk_queue_io_min(gd->queue, PAGE_SIZE);
+                        blk_queue_max_hw_sectors(gd->queue, 256);
+                        blk_queue_max_write_same_sectors(gd->queue, 0);
+                        blk_queue_max_write_zeroes_sectors(gd->queue, 0);
+                        blk_queue_flag_clear(QUEUE_FLAG_DISCARD, gd->queue);
+                        blk_queue_flag_clear(QUEUE_FLAG_NONROT, gd->queue);
+
 			add_disk(gd);
 			printk("md%d: running, size: %llu blocks\n", unit, disk->size);
 		}

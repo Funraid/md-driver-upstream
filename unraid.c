@@ -441,10 +441,8 @@ static void add_stripe_bio(struct stripe_head *sh, struct bio *bi, int unit)
 	else
 		col->write_bi = bi;
 
-	spin_lock_irq(&conf->device_lock);
-	bi->bi_phys_segments++;
+        bio_inc_remaining(bi);
         set_bit(STRIPE_HANDLE, &sh->state);
-	spin_unlock_irq(&conf->device_lock);
 
 	spin_unlock(&sh->stripe_lock);
 
@@ -1126,17 +1124,9 @@ static void handle_stripe(struct stripe_head *sh)
 
 				/* return the failing bio */
 				if (bi) {
-					int remaining;
-
 					bi->bi_status = BLK_STS_IOERR;
-
-					spin_lock_irq(&conf->device_lock);
-					remaining = --bi->bi_phys_segments;
-					spin_unlock_irq(&conf->device_lock);
-					if (remaining == 0) {
-						bi->bi_next = return_bi;
-						return_bi = bi;
-					}
+                                        bi->bi_next = return_bi;
+                                        return_bi = bi;
 				}
 			}
 		}
@@ -1208,22 +1198,16 @@ static void handle_stripe(struct stripe_head *sh)
 
 			if (col->read_bi && buff_uptodate(col)) {
 				struct bio *bi = col->read_bi;
-				int remaining;
 
 				col->read_bi = bi->bi_next;
 				BUG_ON(col->read_bi);
 
 				copy_data(0, bi, sh->srcs[i], sh->sector);
 
-				spin_lock_irq(&conf->device_lock);
-				remaining = --bi->bi_phys_segments;
-				spin_unlock_irq(&conf->device_lock);
-				if (remaining == 0) {
-					bi->bi_next = return_bi;
-					return_bi = bi;
-				}
+                                bi->bi_next = return_bi;
+                                return_bi = bi;
 
-				dprintk("Return read_bi for col %d, remaining %d\n", i, remaining);
+				dprintk("Return read_bi for col %d\n", i);
 				to_read--;
 			}
                 }
@@ -1237,20 +1221,14 @@ static void handle_stripe(struct stripe_head *sh)
 
 			if (col->written_bi && buff_uptodate(col) && !buff_locked(col)) {
 				struct bio *bi = col->written_bi;
-				int remaining;
 
 				col->written_bi = bi->bi_next;
 				BUG_ON(col->written_bi);
 
-				spin_lock_irq(&conf->device_lock);
-				remaining = --bi->bi_phys_segments;
-				spin_unlock_irq(&conf->device_lock);
-				if (remaining == 0) {
-					bi->bi_next = return_bi;
-					return_bi = bi;
-				}
+                                bi->bi_next = return_bi;
+                                return_bi = bi;
 
-				dprintk("Return write_bi for col %d, remaining %d\n", i, remaining);
+				dprintk("Return write_bi for col %d\n", i);
 				written--;
 			}
 		}
@@ -1618,7 +1596,6 @@ static void handle_stripe(struct stripe_head *sh)
 		struct bio *bi = return_bi;
 		return_bi = bi->bi_next;
 		bi->bi_next = NULL;
-		bi->bi_iter.bi_size = 0;
 		bio_endio(bi);
 	}
 
@@ -1757,7 +1734,6 @@ blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 	unraid_conf_t *conf = mddev_to_conf(mddev);
 	int rw = bio_data_dir(bi), cpu;
 	sector_t stripe_sector, last_sector;
-	int remaining;
 
 	if (md_trace >= 4)
 		printk("unraid_make_request: unit=%d rwa=%x sector=%llu nsect=%u vcnt=%u\n",
@@ -1780,10 +1756,8 @@ blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 	part_stat_unlock();
 
 	stripe_sector = STRIPE_SECTOR(bi->bi_iter.bi_sector);
-	last_sector = bi->bi_iter.bi_sector + (bi->bi_iter.bi_size>>9);
-
+	last_sector = bio_end_sector(bi);
 	bi->bi_next = NULL;
-	bi->bi_phys_segments = 1;  /* overloaded to count active stripes for this i/o */
 	
 	while (stripe_sector < last_sector) {
 		struct stripe_head *sh;
@@ -1802,15 +1776,7 @@ blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 		stripe_sector += BUFFER_SECT;
 	}
 	
-	/* handle case where i/o immediately finishes */
-	spin_lock_irq(&conf->device_lock);
-	remaining = --bi->bi_phys_segments;
-	spin_unlock_irq(&conf->device_lock);
-	if (remaining == 0) {
-		bi->bi_next = NULL;
-		bi->bi_iter.bi_size = 0;
-		bio_endio(bi);
-	}
+        bio_endio(bi);
 
         return BLK_QC_T_NONE;
 }
