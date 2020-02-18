@@ -1,6 +1,6 @@
 /*
  * unraid.c : UnRaid management functions.
- *         Copyright (C) 2006-2016, Tom Mortensen <tomm@lime-technology.com>
+ *         Copyright (C) 2006-2019, Tom Mortensen <tomm@lime-technology.com>
  *         Copyright (C) 2016, Eric Schultz <erics@lime-technology.com>
  *
  * Derived from:
@@ -27,7 +27,7 @@
  * The following can be used to debug the driver
  */
 extern int md_trace;
-#define dprintk(x...) ((void)((md_trace >= 5) && printk(x)))
+#define dprintk(x...) ((void)((md_trace >= 4) && printk(x)))
 
 #define UNRAID_PARANOIA	1
 #if UNRAID_PARANOIA && defined(CONFIG_SMP)
@@ -111,7 +111,6 @@ extern int md_trace;
  *
  * The inactive_list, handle_list and hash bucket lists are all protected by the
  * device_lock.
- *  - stripes on the inactive_list never have their stripe_lock held.
  *  - stripes have a reference counter. If count==0, they are on a list.
  *  - If a stripe might need handling, STRIPE_HANDLE is set.
  *  - When refcount reaches zero, then if STRIPE_HANDLE it is put on
@@ -140,13 +139,14 @@ extern int md_trace;
  * on a cached buffer.
  * 
  * Since a single bio could span multiple stripes, we keep a count of how many stripes of the bio
- * remain to be completed.  When this count reaches zero, we can return the bio.  Changes to the bio
- * stripe count are protected by the device_lock.
- */
+ * remain to be completed.  When this count reaches zero, we can return the bio.
+  */
 
 /* These are tunables defined in md.c */
 extern int md_num_stripes;      /* number of stripes to allocate */
 extern int md_write_method;     /* default write algorithm, refer to md_private.h */
+extern int md_queue_limit;      /* max queue depth ceiling as percentage [1..100] for I/O */
+extern int md_sync_limit;       /* max queue depth ceiling as percentage [1..100] for resync */
 
 /* Buffer size in bytes */
 #define BUFFER_SIZE             PAGE_SIZE
@@ -201,10 +201,11 @@ struct stripe_head {
 	struct list_head	lru;			/* inactive_list or handle_list */
 	struct unraid_conf	*conf;
 
+        int                     unit;
 	sector_t                sector;			/* sector of this row */
 	unsigned long		state;			/* stripe state flags */
 	atomic_t		count;			/* nr of active thread/requests */
-	spinlock_t		stripe_lock;
+        int                     write_method;
 
         void                    *srcs[MD_SB_DISKS];     /* buffer addresses */
 	column_t                col[0];                 /* column information */
@@ -224,15 +225,14 @@ typedef struct unraid_conf {
 	struct kmem_cache       *slab_cache;
 	int                     num_stripes;
 
-	mdk_thread_t            *thread;
-	struct list_head	handle_list;            /* stripes needing handling */
+	mdk_thread_t            *thread[MD_SB_DISKS-1];
+	struct list_head	handle_list[MD_SB_DISKS-1]; /* stripes needing handling */
 
 	struct list_head	inactive_list;
-	atomic_t		inactive_blocked;
 
 	wait_queue_head_t	wait_for_stripe;
 	atomic_t                active_flushes;
-	atomic_t		active_stripes;
+	atomic_t		active_stripes[MD_SB_DISKS-1];
 
 	spinlock_t		device_lock;
 } unraid_conf_t;
@@ -289,29 +289,11 @@ static struct stripe_head *get_free_stripe(unraid_conf_t *conf)
 
 	if (!list_empty(&conf->inactive_list)) {
 		struct list_head *first;
-		int i;
 
 		first = conf->inactive_list.next;
 		sh = list_entry(first, struct stripe_head, lru);
 		list_del_init(first);
 		remove_hash(sh);
-
-		/* sanity checks */
-		BUG_ON(spin_is_locked(&sh->stripe_lock));
-		BUG_ON(atomic_read(&sh->count) != 0);
-                BUG_ON(sh->state != 0);
-		for (i = 0; i < conf->disks; i++) {
-			column_t *col = &sh->col[i];
-			if (col->read_bi || col->write_bi || col->written_bi || buff_locked(col)) {
-				dprintk("sector=%llu i=%d %p %p %p %lu\n",
-					(unsigned long long)sh->sector, i, col->read_bi,
-					col->write_bi, col->written_bi,
-					buff_locked(col));
-				BUG();
-			}
-		}
-
-                atomic_inc(&conf->active_stripes);
 	}
 
 	return sh;
@@ -345,7 +327,51 @@ static void init_stripe(struct stripe_head *sh, sector_t sector)
         }
 
 	insert_hash(conf, sh);
+
 	dprintk("init_stripe: stripe %llu\n", (unsigned long long)sh->sector);
+}
+
+/* Sanity checks on alloocated stripe.
+ */
+static void sanity_check(struct stripe_head *sh)
+{
+	unraid_conf_t *conf = sh->conf;
+        int i;
+
+        if (sh->state != 0) {
+                dprintk("sector=%llu state=%lu\n",
+                        (unsigned long long)sh->sector, sh->state);
+                BUG();
+        }
+        for (i = 0; i < conf->disks; i++) {
+                column_t *col = &sh->col[i];
+                if (col->read_bi || col->write_bi || col->written_bi || buff_locked(col)) {
+                        dprintk("sector=%llu i=%d %llu %llu %llu %lu\n",
+                                (unsigned long long)sh->sector, i,
+                                (unsigned long long)col->read_bi,
+                                (unsigned long long)col->write_bi,
+                                (unsigned long long)col->written_bi,
+                                buff_locked(col));
+                        BUG();
+                }
+        }
+}
+
+static int stripe_limit( unraid_conf_t *conf, int unit, int *activeP)
+{
+        int active = 0;
+        int queue_limit, i;
+
+        for (i = 0; i <= conf->disks-2; i++) {
+                if ((i == unit) || atomic_read(&conf->active_stripes[i]))
+                        active++;
+	}
+        *activeP = active;
+
+        /* throttle back resync process when other I/O is active */
+        queue_limit = ((unit == 0) && (active > 1)) ? md_sync_limit : md_queue_limit;
+
+        return ((conf->num_stripes * md_queue_limit) + (active * 100)/2) / (active * 100);
 }
 
 /* If requests are coming in at a faster rate than they are being completed, then eventually a thread
@@ -353,88 +379,76 @@ static void init_stripe(struct stripe_head *sh, sector_t sector)
  * will enqueue itself onto the conf->wait_for_stripe queue.
  * Meanwhile, as each I/O completes, release_stripe() frees the stripe and wakes up all waiting threads.
  */
-static struct stripe_head *get_active_stripe(unraid_conf_t *conf, sector_t sector, int noblock)
+static int _get_active_stripe(unraid_conf_t *conf, int unit, sector_t sector, int noblock, struct stripe_head **shP)
 {
 	struct stripe_head *sh = NULL;
+        int active;
 
-	dprintk("get_stripe, sector %llu\n", (unsigned long long)sector);
+	CHECK_DEVLOCK();
 
-	spin_lock_irq(&conf->device_lock);
-	do {
-		sh = find_stripe(conf, sector);
-		if (!sh) {
-			sh = get_free_stripe(conf);
-			if (sh)
-				init_stripe(sh, sector);
-			else {
-                                if (noblock)
-					break;
-				/* wait for a stripe to be freed */
-				atomic_inc(&conf->inactive_blocked);
-				wait_lock_irq(conf->wait_for_stripe, conf->device_lock);
-				atomic_dec(&conf->inactive_blocked);
-			}
-		}
-		else {
-			if (atomic_read(&sh->count)) {
-				/* stripe has pending i/o, so should not be on any list */
-				BUG_ON(!list_empty(&sh->lru));
-				/* wait for a stripe to be freed */
-				atomic_inc(&conf->inactive_blocked);
-				wait_lock_irq(conf->wait_for_stripe, conf->device_lock);
-				atomic_dec(&conf->inactive_blocked);
+        if (atomic_read(&conf->active_stripes[unit]) < stripe_limit(conf, unit, &active)) {
+                sh = find_stripe(conf, sector);
+                if (!sh) {
+                        sh = get_free_stripe(conf);
+                        if (sh) {
+                                init_stripe(sh, sector);
+                        }
+                }
+                else {
+                        if (atomic_read(&sh->count)) {
+                                /* stripe has pending i/o, so should not be on any list */
+                                BUG_ON(!list_empty(&sh->lru));
                                 sh = NULL;
-			} else {
-				/* no i/o pending, so either in handle list or inactive list */
-				BUG_ON(list_empty(&sh->lru));
-				if (test_bit(STRIPE_HANDLE, &sh->state)) {
-                                        /* still in handle list */
-                                        /* wait for a stripe to be freed */
-                                        atomic_inc(&conf->inactive_blocked);
-                                        wait_lock_irq(conf->wait_for_stripe, conf->device_lock);
-                                        atomic_dec(&conf->inactive_blocked);
-                                        sh = NULL;
-                                }
-				else {
+                        }
+                        else {
+                                /* no i/o pending, so either in handle list or inactive list */
+                                BUG_ON(list_empty(&sh->lru));
+                                if (!test_bit(STRIPE_HANDLE, &sh->state)) {
                                         /* remove it from inactive list */
                                         list_del_init(&sh->lru);
-					/* stripe is now active */
-					atomic_inc(&conf->active_stripes);
-				}
-			}
-		}
-	} while (sh == NULL);
-        
+                                }
+                                else {
+                                        /* still in handle list */
+                                        sh = NULL;
+                                }
+                        }
+                }
+	}
 	if (sh) {
+                sh->unit = unit;
+                sanity_check(sh);
+                /* stripe is now active */
 		atomic_inc(&sh->count);
+                atomic_inc(&conf->active_stripes[unit]);
+                /* force read-modify-write if more than one active stream */
+                sh->write_method = (active == 1) ? md_write_method : READ_MODIFY_WRITE;
         }
+        *shP = sh;
+        return (sh != NULL) || noblock;
+}
 
+static struct stripe_head *get_active_stripe(unraid_conf_t *conf, int unit, sector_t sector, int noblock)
+{
+	struct stripe_head *sh;
+
+	dprintk("get_stripe, unit %i sector %llu\n", unit, (unsigned long long)sector);
+
+	spin_lock_irq(&conf->device_lock);
+	while (1) {
+                wait_event_lock_irq(conf->wait_for_stripe,
+                                    _get_active_stripe( conf, unit, sector, noblock, &sh),
+                                    conf->device_lock);
+                if (sh || noblock)
+                        break;
+        }
 	spin_unlock_irq(&conf->device_lock);
+
 	return sh;
 }
 
-static void add_stripe_bio(struct stripe_head *sh, struct bio *bi, int unit)
+static void add_stripe_bio(struct stripe_head *sh, struct bio *bi)
 {
-	unraid_conf_t *conf = sh->conf;
-	int disks = conf->disks, pd_idx=disks-2, i;
-	column_t *col = NULL;
-
-	/* find our data column */
-	for (i = 0; i < pd_idx; i++) {
-                mdp_disk_t *disk = conf->disk[i];
-
-                if (disk->number == unit) {
-                        col = &sh->col[i];
-			break;
-                }
-	}
-	BUG_ON(!col);
-
-	spin_lock(&sh->stripe_lock);
-
-	BUG_ON(col->read_bi);
-	BUG_ON(col->write_bi);
-	BUG_ON(col->written_bi);
+	column_t *col = &sh->col[sh->unit-1];
 
 	if (bio_data_dir(bi) == READ)
 		col->read_bi = bi;
@@ -442,12 +456,9 @@ static void add_stripe_bio(struct stripe_head *sh, struct bio *bi, int unit)
 		col->write_bi = bi;
 
         bio_inc_remaining(bi);
-        set_bit(STRIPE_HANDLE, &sh->state);
-
-	spin_unlock(&sh->stripe_lock);
 
 	dprintk("added bio b#%llu to stripe s#%llu, col %d\n",
-		(unsigned long long)bi->bi_iter.bi_sector, (unsigned long long)sh->sector, i);
+		(unsigned long long)bi->bi_iter.bi_sector, (unsigned long long)sh->sector, sh->unit);
 }
 
 static int partial_write(struct stripe_head *sh, column_t *col)
@@ -462,7 +473,6 @@ static int partial_write(struct stripe_head *sh, column_t *col)
 static void _release_stripe(unraid_conf_t *conf, struct stripe_head *sh)
 {
 	CHECK_DEVLOCK();
-	
 	BUG_ON(atomic_read(&sh->count) <= 0);
 	
 	if (atomic_dec_and_test(&sh->count)) {
@@ -470,12 +480,12 @@ static void _release_stripe(unraid_conf_t *conf, struct stripe_head *sh)
 		BUG_ON(!list_empty(&sh->lru));
 
 		if (test_bit(STRIPE_HANDLE, &sh->state)) {
-			list_add_tail(&sh->lru, &conf->handle_list);
-			md_wakeup_thread(conf->thread);
+                        list_add_tail(&sh->lru, &conf->handle_list[sh->unit]);
+                        md_wakeup_thread(conf->thread[sh->unit]);
 		}
 		else {
 			list_add_tail(&sh->lru, &conf->inactive_list);
-			atomic_dec(&conf->active_stripes);
+			atomic_dec(&conf->active_stripes[sh->unit]);
 
 			wake_up_all(&conf->wait_for_stripe);
 			dprintk("stripe %llu, released\n", (unsigned long long)sh->sector);
@@ -514,7 +524,7 @@ static void end_request(struct bio *bi)
 
 	spin_lock_irqsave(&conf->device_lock, flags);
 	set_bit(MD_BUFF_IO_DONE, &col->state);
-	set_bit(STRIPE_HANDLE, &sh->state);
+        set_bit(STRIPE_HANDLE, &sh->state);
 	_release_stripe(conf, sh);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
 }
@@ -637,7 +647,7 @@ static void raid6_generate_pq(struct stripe_head *sh)
 
 /* Note: there is no raid6 function that just generates Q from D - the one we have to
  * use, raid6_gen_syndrome(), generates both P and Q.  We'll go ahead and set P buffer
- * uptodate, but we don't want it scheduled for write, so we don't lock it.
+ * uptodate, but we don't need it scheduled for write, so we don't lock it.
  */
 static void raid6_generate_q(struct stripe_head *sh)
 {
@@ -723,8 +733,8 @@ static void copy_write_data(struct stripe_head *sh)
 
                         BUG_ON(col->written_bi);
                         col->written_bi = col->write_bi;
-                        col->write_bi = col->write_bi->bi_next;
-                        BUG_ON(col->write_bi);
+                        col->write_bi = NULL;
+                        break;
                 }
         }
 }
@@ -749,6 +759,7 @@ void rmw5_write_data(struct stripe_head *sh)
                         BUG_ON(!buff_uptodate(col));
                         ptr[count++] = sh->srcs[i];
                         check_xor();
+                        break;
                 }
         }
         if (count) {
@@ -769,8 +780,9 @@ void rmw5_write_data(struct stripe_head *sh)
 
                         BUG_ON(col->written_bi);
                         col->written_bi = col->write_bi;
-                        col->write_bi = col->write_bi->bi_next;
+                        col->write_bi = NULL;
                         BUG_ON(col->write_bi);
+                        break;
                 }
         }
         if (count) {
@@ -816,8 +828,8 @@ static void rmw6_write_data(struct stripe_head *sh, int pd_uptodate)
 
                         BUG_ON(col->written_bi);
                         col->written_bi = col->write_bi;
-                        col->write_bi = col->write_bi->bi_next;
-                        BUG_ON(col->write_bi);
+                        col->write_bi = NULL;
+                        break;
                 }
         }
 
@@ -1012,15 +1024,16 @@ static void handle_stripe(struct stripe_head *sh)
 
 	dprintk("handling stripe %llu, cnt=%d\n", (unsigned long long)sh->sector, atomic_read(&sh->count));
 
-	spin_lock(&sh->stripe_lock);
-
 	/* Capture the state of the stripe.
 	 */
 	for (i = 0; i < disks; i++) {
 		column_t *col = &sh->col[i];
 
-		dprintk("check col %d: state 0x%lx read %p write %p written %p\n",
-                        i, col->state, col->read_bi, col->write_bi, col->written_bi);
+		dprintk("check col %d: state 0x%lx read %llu write %llu written %llu\n",
+                        i, col->state,
+                        (unsigned long long)col->read_bi,
+                        (unsigned long long)col->write_bi,
+                        (unsigned long long)col->written_bi);
 
 		/* check for completed disk I/O */
 		if (test_and_clear_bit(MD_BUFF_IO_DONE, &col->state)) {
@@ -1081,52 +1094,52 @@ static void handle_stripe(struct stripe_head *sh)
                                 failb = i;
 		}
 	}
+        /* check for config change requiring superblock update */
+        if (update_sb)
+                md_update_sb(conf->mddev);
 
 	dprintk("locked=%d to_read=%d to_write=%d written=%d failed=%d faila=%d failb=%d\n",
 		locked, to_read, to_write, written, failed, faila, failb);
 
 	/* Check if the array has more than 2 failures, and if so, any request posted to an
 	 * invalid drive must be failed.
+         * Note: a reconstruct-write could be changed to a straight-write if there are 3 or
+         * more failures; however parity would not be updated.  Instead, we choose to fail
+         * the write in this corner case.
 	 */
 	if (failed > 2) {
 		for (i = 0; i < pd_idx; i++) {
 			column_t *col = &sh->col[i];
 
 			if (!disk_valid(col)) {
-				struct bio *bi = NULL;
-
 				/* fail reads */
 				if (col->read_bi) {
-					bi = col->read_bi;
-					col->read_bi = bi->bi_next;
-					BUG_ON(col->read_bi);
 					dprintk("Fail read_bi for col %d\n", i);
+					return_bi = col->read_bi;
+					col->read_bi = NULL;
+					return_bi->bi_status = BLK_STS_IOERR;
 					to_read--;
+                                        break;
 				}
 				else
 				/* fail unstarted writes */
 				if (col->write_bi) {
-					bi = col->write_bi;
-					col->write_bi = bi->bi_next;
-					BUG_ON(col->write_bi);
 					dprintk("Fail write_bi for col %d\n", i);
+					return_bi = col->write_bi;
+					col->write_bi = NULL;
+					return_bi->bi_status = BLK_STS_IOERR;
 					to_write--;
+                                        break;
 				}
 				else
 				/* fail writes */
 				if (col->written_bi) {
-					bi = col->written_bi;
-					col->written_bi = bi->bi_next;
-					BUG_ON(col->written_bi);
 					dprintk("Fail written_bi for col %d\n", i);
+					return_bi = col->written_bi;
+					col->written_bi = NULL;
+					return_bi->bi_status = BLK_STS_IOERR;
 					written--;
-				}
-
-				/* return the failing bio */
-				if (bi) {
-					bi->bi_status = BLK_STS_IOERR;
-                                        bi->bi_next = return_bi;
-                                        return_bi = bi;
+                                        break;
 				}
 			}
 		}
@@ -1150,8 +1163,8 @@ static void handle_stripe(struct stripe_head *sh)
                                 }
                                 else {
                                         need_recovery = 1;
-                                        break;
                                 }
+                                break;
                         }
                 }
                 if (need_recovery) {
@@ -1197,18 +1210,12 @@ static void handle_stripe(struct stripe_head *sh)
                         column_t *col = &sh->col[i];
 
 			if (col->read_bi && buff_uptodate(col)) {
-				struct bio *bi = col->read_bi;
-
-				col->read_bi = bi->bi_next;
-				BUG_ON(col->read_bi);
-
-				copy_data(0, bi, sh->srcs[i], sh->sector);
-
-                                bi->bi_next = return_bi;
-                                return_bi = bi;
-
 				dprintk("Return read_bi for col %d\n", i);
+				return_bi = col->read_bi;
+				col->read_bi = NULL;
+				copy_data(0, return_bi, sh->srcs[i], sh->sector);
 				to_read--;
+                                break;
 			}
                 }
 	}
@@ -1220,16 +1227,11 @@ static void handle_stripe(struct stripe_head *sh)
 			column_t *col = &sh->col[i];
 
 			if (col->written_bi && buff_uptodate(col) && !buff_locked(col)) {
-				struct bio *bi = col->written_bi;
-
-				col->written_bi = bi->bi_next;
-				BUG_ON(col->written_bi);
-
-                                bi->bi_next = return_bi;
-                                return_bi = bi;
-
 				dprintk("Return write_bi for col %d\n", i);
+				return_bi = col->written_bi;
+				col->written_bi = NULL;
 				written--;
+                                break;
 			}
 		}
 	}
@@ -1238,7 +1240,7 @@ static void handle_stripe(struct stripe_head *sh)
 	 */
 	if (to_write) {
                 /* read/modify/write cases */
-                if (md_write_method == READ_MODIFY_WRITE && disks > 3 &&
+                if (sh->write_method == READ_MODIFY_WRITE && disks > 3 &&
                     disk_enabled(&sh->col[pd_idx]) && disk_enabled(&sh->col[qd_idx]) &&
                     ((failed == 0) ||
                      (failed == 1 && faila < pd_idx && !sh->col[faila].write_bi) ||
@@ -1260,11 +1262,11 @@ static void handle_stripe(struct stripe_head *sh)
                         }
                 }
                 else
-                if (md_write_method == READ_MODIFY_WRITE && disks > 3 &&
+                if (sh->write_method == READ_MODIFY_WRITE && disks > 3 &&
                     disk_enabled(&sh->col[pd_idx]) && !disk_enabled(&sh->col[qd_idx]) &&
                     ((failed == 1) ||
                      (faila < pd_idx && !sh->col[faila].write_bi))) {
-                        /* read read d,P */
+                        /* read d,P */
                         for (i = 0; i < qd_idx; i++) {
                                 column_t *col = &sh->col[i];
                                 if ((col->write_bi || i == pd_idx) &&
@@ -1280,7 +1282,7 @@ static void handle_stripe(struct stripe_head *sh)
                         }
                 }
                 else
-                if (md_write_method == READ_MODIFY_WRITE && disks > 3 &&
+                if (sh->write_method == READ_MODIFY_WRITE && disks > 3 &&
                     !disk_enabled(&sh->col[pd_idx]) && disk_enabled(&sh->col[qd_idx]) &&
                     ((failed == 1) ||
                      (failb != qd_idx && !sh->col[faila].write_bi))) {
@@ -1342,12 +1344,12 @@ static void handle_stripe(struct stripe_head *sh)
                                 }
                         }
                         else
-                        if (faila < pd_idx && sh->col[faila].write_bi && !partial_write(sh, &sh->col[faila])) {
-                                /* a target data disk failed */
+                        if (sh->col[faila].write_bi && !partial_write(sh, &sh->col[faila])) {
+                                /* a target data disk failed, writing full block */
                                 /* read all data cols except faila */
                                 for (i = 0; i < pd_idx; i++) {
                                         column_t *col = &sh->col[i];
-                                        if (i != faila && (!col->write_bi || partial_write(sh, col)) &&
+                                        if ((i != faila) &&
                                             !buff_uptodate(col) && !buff_locked(col)) {
                                                 dprintk("Read_old col %d for Reconstruct write\n", i);
                                                 locked += schedule_read(col, i);
@@ -1361,8 +1363,8 @@ static void handle_stripe(struct stripe_head *sh)
                                 }
                         }
                         else
-                        if (faila < pd_idx && (!sh->col[faila].write_bi || partial_write(sh, &sh->col[faila]))) {
-                                /* some other data disk failed */
+                        if (!sh->col[faila].write_bi || partial_write(sh, &sh->col[faila])) {
+                                /* some other data disk failed or read for partial-write failed */
                                 /* read all cols except faila and Q (need to generate old-d) */
                                 for (i = 0; i < qd_idx; i++) {
                                         column_t *col = &sh->col[i];
@@ -1430,15 +1432,13 @@ static void handle_stripe(struct stripe_head *sh)
                                                 raid5_generate_p(sh);
                                 }
                                 else {
-                                        /* impossible */
                                         BUG();
                                 }
                                 locked += schedule_writes(sh);
                         }
                 }
-                /* straignt-write case */
                 else {
-                        /* more than 2 failures or P and Q both disabled */
+                        /* straight-write cases */
                         /* if partial write we need to read first */
                         for (i = 0; i < pd_idx; i++) {
                                 column_t *col = &sh->col[i];
@@ -1446,6 +1446,7 @@ static void handle_stripe(struct stripe_head *sh)
                                     !buff_uptodate(col) && !buff_locked(col)) {
                                         dprintk("Read_old col %d for partial write\n", i);
                                         locked += schedule_read(col, i);
+                                        break;
                                 }
                         }
                         /* if nothing locked, reads are done */
@@ -1585,19 +1586,10 @@ static void handle_stripe(struct stripe_head *sh)
 		clear_bit(STRIPE_INSYNC, &sh->state);
 	}
                         
-	spin_unlock(&sh->stripe_lock);
-
-        /* check for config change requiring superblock update */
-        if (update_sb)
-                md_update_sb(conf->mddev);
-
-	/* return all completed requests */
-	while (return_bi) {
-		struct bio *bi = return_bi;
-		return_bi = bi->bi_next;
-		bi->bi_next = NULL;
-		bio_endio(bi);
-	}
+        /* Maybe a request completed.
+         */
+	if (return_bi)
+		bio_endio(return_bi);
 
 	/* start new i/o */
 	for (i = 0; i < disks; i++) {
@@ -1732,10 +1724,10 @@ static void handle_flush(mddev_t *mddev, int unit, struct bio *bi)
 blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 {
 	unraid_conf_t *conf = mddev_to_conf(mddev);
-	int rw = bio_data_dir(bi), cpu;
+	int rw = bio_data_dir(bi);
 	sector_t stripe_sector, last_sector;
 
-	if (md_trace >= 4)
+	if (md_trace >= 3)
 		printk("unraid_make_request: unit=%d rwa=%x sector=%llu nsect=%u vcnt=%u\n",
 		       unit, bi->bi_opf, (unsigned long long)bi->bi_iter.bi_sector, (bi->bi_iter.bi_size>>9), bi->bi_vcnt);
 
@@ -1750,21 +1742,21 @@ blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 	}
 	
 	/* update statistics */
-	cpu = part_stat_lock();
-	part_stat_inc(cpu, &mddev->gendisk[unit]->part0, ios[rw]);
-	part_stat_add(cpu, &mddev->gendisk[unit]->part0, sectors[rw], bio_sectors(bi));
-	part_stat_unlock();
+        part_stat_lock();
+        part_stat_inc(&mddev->gendisk[unit]->part0, ios[rw]);
+        part_stat_add(&mddev->gendisk[unit]->part0, sectors[rw], bio_sectors(bi));
+        part_stat_unlock();
 
 	stripe_sector = STRIPE_SECTOR(bi->bi_iter.bi_sector);
 	last_sector = bio_end_sector(bi);
-	bi->bi_next = NULL;
 	
 	while (stripe_sector < last_sector) {
 		struct stripe_head *sh;
 
-		sh = get_active_stripe(conf, stripe_sector, (bi->bi_opf & REQ_RAHEAD));
+		sh = get_active_stripe(conf, unit, stripe_sector, (bi->bi_opf & REQ_RAHEAD));
 		if (sh) {
-			add_stripe_bio(sh, bi, unit);
+			add_stripe_bio(sh, bi);
+                        set_bit(STRIPE_HANDLE, &sh->state);
 			release_stripe(sh);
 		}
 		else {
@@ -1787,12 +1779,10 @@ blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 int unraid_sync(mddev_t *mddev, sector_t sector_nr)
 {
 	unraid_conf_t *conf = mddev_to_conf(mddev);
-	struct stripe_head *sh = get_active_stripe(conf, sector_nr, 0);
+	struct stripe_head *sh = get_active_stripe(conf, 0, sector_nr, 0);
         int i;
 
-	spin_lock(&sh->stripe_lock);
         set_bit(STRIPE_SYNCING, &sh->state);
-
         if (mddev->num_new) {
                 set_bit(STRIPE_CLEARING, &sh->state);
         }
@@ -1806,9 +1796,8 @@ int unraid_sync(mddev_t *mddev, sector_t sector_nr)
                         }
                 }
         }
-	spin_unlock(&sh->stripe_lock);
 
-        handle_stripe(sh);
+        set_bit(STRIPE_HANDLE, &sh->state);
 	release_stripe(sh);
 
 	return BUFFER_SECT;
@@ -1817,28 +1806,27 @@ int unraid_sync(mddev_t *mddev, sector_t sector_nr)
 /*
  * This is our unraid kernel thread.
  */
-static void unraidd(mddev_t *mddev, unsigned long unused)
+static void unraidd(mddev_t *mddev, unsigned long unit)
 {
 	unraid_conf_t *conf = mddev_to_conf(mddev);
 	int count = 0;
 	struct blk_plug plug;
 
-	dprintk("unraidd: activated\n");
+	dprintk("unraidd%d: activated\n", (int)unit);
 
 	blk_start_plug(&plug);
 
 	spin_lock_irq(&conf->device_lock);
-	while (!list_empty(&conf->handle_list)) {
+	while (!list_empty(&conf->handle_list[unit])) {
 		struct list_head *first;
 		struct stripe_head *sh;
 
-		first = conf->handle_list.next;
+		first = conf->handle_list[unit].next;
 		sh = list_entry(first, struct stripe_head, lru);
 		list_del_init(first);
 		clear_bit(STRIPE_HANDLE, &sh->state);
-
+		BUG_ON(atomic_read(&sh->count) != 0);
 		atomic_inc(&sh->count);
-		BUG_ON(atomic_read(&sh->count) != 1);
 
 		spin_unlock_irq(&conf->device_lock);
 
@@ -1852,7 +1840,7 @@ static void unraidd(mddev_t *mddev, unsigned long unused)
 
 	blk_finish_plug(&plug);
 
-        dprintk("unraidd: handled %d stripes\n", count);
+        dprintk("unraidd%d: handled %d stripes\n", (int)unit, count);
 }
 
 /* Resource allocation */
@@ -1902,9 +1890,11 @@ static int grow_stripes(unraid_conf_t *conf, int num)
 {
         size_t stripe_head_size = sizeof(struct stripe_head) + sizeof(column_t)*conf->disks;
 
-	conf->slab_cache = kmem_cache_create("unraid/md", stripe_head_size, 0, 0, NULL);
-	if (conf->slab_cache == NULL)
-		return 1;
+	if (conf->slab_cache == NULL) {
+                conf->slab_cache = kmem_cache_create("unraid/md", stripe_head_size, 0, 0, NULL);
+                if (conf->slab_cache == NULL)
+                        return 0;
+        }
 
 	while (num--) {
                 struct stripe_head *sh;
@@ -1916,7 +1906,6 @@ static int grow_stripes(unraid_conf_t *conf, int num)
 
 		sh->conf = conf;
 		INIT_LIST_HEAD(&sh->lru);
-		spin_lock_init(&sh->stripe_lock);
 
 		/* allocate stripe page buffers */
 		if (grow_buffers(sh, conf->disks))
@@ -1925,47 +1914,51 @@ static int grow_stripes(unraid_conf_t *conf, int num)
 		conf->num_stripes++;
 
 		/* we just created an active stripe so... */
-		atomic_inc(&conf->active_stripes);
+		atomic_inc(&conf->active_stripes[0]);
 		atomic_set(&sh->count, 1);
 		release_stripe(sh);
 	}
 
-	return 0;
+	return 1;
 }
 
-static void shrink_stripes(unraid_conf_t *conf)
+static void shrink_stripes(unraid_conf_t *conf, int num)
 {
 	struct stripe_head *sh;
 
-	while (conf->num_stripes--) {
+	while (conf->num_stripes && num--) {
                 spin_lock_irq(&conf->device_lock);
-                while ((sh = get_free_stripe(conf)) == NULL) {
-                        /* wait for a stripe to be freed */
-                        atomic_inc(&conf->inactive_blocked);
-                        wait_lock_irq(conf->wait_for_stripe, conf->device_lock);
-                        atomic_dec(&conf->inactive_blocked);
-                }
+                wait_event_lock_irq(conf->wait_for_stripe,
+                                    ((sh = get_free_stripe(conf))!=NULL),
+                                    conf->device_lock);
                 spin_unlock_irq(&conf->device_lock);
 
 		shrink_buffers(sh, conf->disks);
 		kmem_cache_free(conf->slab_cache, sh);
-		atomic_dec(&conf->active_stripes);
-	}
 
-	if (conf->slab_cache) {
+                conf->num_stripes--;
+        }
+
+	if (conf->slab_cache && !conf->num_stripes) {
 		kmem_cache_destroy(conf->slab_cache);
 		conf->slab_cache = NULL;
 	}
 }
 
-/* Where N is number of data disks, sh->col[] is arranged:
- *   0 => disk1
- *   :
- * N-1 => diskN
- *   N => P (parity)
- * N+1 => Q
- *
- * The superblock device slots are assigned:
+int unraid_num_stripes(mddev_t *mddev, int num_stripes)
+{
+	unraid_conf_t *conf = mddev_to_conf(mddev);
+
+        if (num_stripes > conf->num_stripes)
+                grow_stripes(conf, num_stripes-conf->num_stripes);
+        else
+        if (num_stripes < conf->num_stripes)
+                shrink_stripes(conf, conf->num_stripes-num_stripes);
+
+        return conf->num_stripes;
+}
+
+/* The superblock device slots are assigned:
  *   0 => P (parity)
  *   1 => disk1
  *   :
@@ -1974,6 +1967,19 @@ static void shrink_stripes(unraid_conf_t *conf)
  *  30 => reserved (for R)
  *
  * Max number of devices = MD_SB_DISKS = 30.
+ *
+ * Where N is number of data disks, sh->col[] is arranged:
+ *   0 => disk1
+ *   :
+ * N-1 => diskN
+ *   N => P (parity)
+ * N+1 => Q
+ *
+ * conf->thread[] is arranged:
+ *   0 => sync thread
+ *   1 => disk1 thread
+ *   :
+ *   N => diskN thread
  */
 int unraid_run(mddev_t *mddev)
 {
@@ -2003,17 +2009,25 @@ int unraid_run(mddev_t *mddev)
 
 	spin_lock_init(&conf->device_lock);
 	init_waitqueue_head(&conf->wait_for_stripe);
-	INIT_LIST_HEAD(&conf->handle_list);
 	INIT_LIST_HEAD(&conf->inactive_list);
-        atomic_set(&conf->active_flushes, 0);
-        atomic_set(&conf->active_stripes, 0);
 
-	/* allocate our i/o completion daemon */
-	conf->thread = md_register_thread(unraidd, mddev, 0, "unraidd");
-	if (!conf->thread) {
-		printk("unraid: couldn't allocate unraidd thread\n");
-		goto abort;
-	}
+	/* allocate our i/o completion daemons */
+        for (i = 0; i <= conf->disks-2; i++) {
+                mdp_disk_t *disk = &mddev->sb.disks[i];
+                char name[16];
+
+                if (i && !disk_active(disk))
+                        continue;
+
+                INIT_LIST_HEAD(&conf->handle_list[i]);
+
+                sprintf( name, "unraidd%d", i);
+                conf->thread[i] = md_register_thread(unraidd, mddev, i, name);
+                if (!conf->thread[i]) {
+                        printk("unraid: couldn't allocate %s thread\n", name);
+                        goto abort;
+                }
+        }
 
 	/* allocate stripe cache hash table */
 	if ((conf->stripe_hashtbl = kzalloc(PAGE_SIZE, GFP_KERNEL)) == NULL)
@@ -2025,16 +2039,19 @@ int unraid_run(mddev_t *mddev)
 	printk("unraid: allocating %uK for %d stripes (%d disks)\n",
 	       memory, md_num_stripes, conf->disks);
 
-	if (grow_stripes(conf, md_num_stripes)) {
+	if (!grow_stripes(conf, md_num_stripes)) {
 		printk("unraid: couldn't allocate stripe cache\n");
-		shrink_stripes(conf);
+		shrink_stripes(conf, conf->num_stripes);
 		goto abort;
 	}
 
 	return 0;
 abort:
 	if (conf) {
-		md_unregister_thread(conf->thread);
+                for (i = 0; i <= conf->disks-2; i++) {
+                        if (conf->thread[i])
+                                md_unregister_thread(conf->thread[i]);
+                }
 		kfree(conf->stripe_hashtbl);
 		kfree(conf);
 		mddev->private = NULL;
@@ -2046,17 +2063,25 @@ abort:
 int unraid_stop(mddev_t *mddev)
 {
 	unraid_conf_t *conf = mddev_to_conf(mddev);
+        int i;
 	
 	if (conf) {
-		int n = atomic_read(&conf->active_stripes);
-		if (n)
-			printk("unraid_stop: called with %d active stripes!\n", n);
+                int n;
+                for (i = 0; i <= conf->disks-2; i++) {
+                        n = atomic_read(&conf->active_stripes[i]);
+                        if (n)
+                                printk("unraid_stop: called with %d active stripes!\n", n);
+                }
 		n = atomic_read(&conf->active_flushes);
 		if (n)
 			printk("unraid_stop: called with %d active flushes!\n", n);
 
-		shrink_stripes(conf);
-		md_unregister_thread(conf->thread);
+		shrink_stripes(conf, conf->num_stripes);
+
+                for (i = 0; i <= conf->disks-2; i++) {
+                        if (conf->thread[i])
+                                md_unregister_thread(conf->thread[i]);
+                }
 		kfree(conf->stripe_hashtbl);
                 kfree(conf->p_scribble);
                 kfree(conf->q_scribble);
@@ -2070,10 +2095,10 @@ int unraid_stop(mddev_t *mddev)
 int unraid_dump(mddev_t *mddev)
 {
 	unraid_conf_t *conf = mddev_to_conf(mddev);
-	
-        printk("active_stripes=%d\n", atomic_read(&conf->active_stripes));
-	printk("inactive_blocked=%d\n", atomic_read(&conf->inactive_blocked));
-	printk("handle_list_empty=%d\n", list_empty(&conf->handle_list));
+	int i;
+
+        for (i = 0; i <= conf->disks-2; i++)
+                printk("active_stripes[%i]=%i\n", i, atomic_read(&conf->active_stripes[i]));
 
 	return 0;
 }

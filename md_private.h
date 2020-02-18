@@ -1,6 +1,6 @@
 /*
  * md_private.h : (modified) Multiple Devices driver for linux
- *        Copyright (C) 2006-2010 Tom Mortensen
+ *        Copyright (C) 2006-2019 Tom Mortensen
  * 
  * Derived from:
 
@@ -64,7 +64,7 @@ extern void (*raid6_xor_syndrome)(int, int, int, size_t, void **);
  */
 #define MD_MAJOR_VERSION                2
 #define MD_MINOR_VERSION                9
-#define MD_PATCHLEVEL_VERSION           9
+#define MD_PATCHLEVEL_VERSION           10
 
 /****************************************************************************/
 /* 'md_p.h' holds the 'physical' layout of RAID devices */
@@ -267,7 +267,6 @@ typedef struct mddev_s {
         int                     swap_q_idx;
 
 	mdk_rdev_t              rdev[MD_SB_DISKS];
-	spinlock_t              queue_lock;
 	struct gendisk          *gendisk[MD_SB_DISKS];
 } mddev_t;
 
@@ -282,19 +281,6 @@ typedef struct mdk_thread_s {
 } mdk_thread_t;
 
 #define THREAD_WAKEUP  0
-
-#define wait_lock_irq(wq, lock)                                 \
-do {                                                            \
-	wait_queue_entry_t __wait;                              \
-	init_waitqueue_entry(&__wait, current);                 \
-	add_wait_queue(&wq, &__wait);                           \
-	set_current_state(TASK_UNINTERRUPTIBLE);                \
-	spin_unlock_irq(&lock);                                 \
-	schedule();                                             \
-	spin_lock_irq(&lock);                                   \
-	current->state = TASK_RUNNING;                          \
-	remove_wait_queue(&wq, &__wait);                        \
-} while (0)
 
 /****************************************************************************/
 /* md */
@@ -326,6 +312,7 @@ extern int unraid_run(mddev_t *mddev);
 extern int unraid_stop(mddev_t *mddev);
 extern int unraid_dump(mddev_t *mddev);
 extern int unraid_sync(mddev_t *mddev, sector_t sector_nr);
+extern int unraid_num_stripes(mddev_t *mddev, int num_stripes);
 extern blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi);
 
 /****************************************************************************/

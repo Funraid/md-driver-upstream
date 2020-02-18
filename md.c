@@ -1,6 +1,6 @@
 /*
  * md.c : (modified) Multiple Devices driver for Linux
- *         Copyright (C) 2006-2017, Tom Mortensen <tomm@lime-technology.com>
+ *         Copyright (C) 2006-2019, Tom Mortensen <tomm@lime-technology.com>
  *         Copyright (C) 2016, Eric Schultz <erics@lime-technology.com>
  *
  * Greatly revised to support UnRaid in a particular manner.
@@ -45,14 +45,13 @@
 /* MD_TRACE level
  *  0 = no command tracing
  *  1 = printk all commands
- *  2 = printk all commands plus status requests
- *  3 = printk all commands plus md debug info
- *  4 = printk all commands plus md debug info plus read/write commands
- *  5 = printk all commands plus md debug info plus read/write commands plus unraid debug info
+ *  2 = printk all commands plus md debug info
+ *  3 = printk all commands plus md debug info plus unraid read/write commands
+ *  4 = printk all commands plus md debug info plus unraid read/write commands plus unraid debug info
  */
 #define MD_TRACE          1
 int md_trace              = MD_TRACE;          /* command/debug tracing */
-#define dprintk(x...) ((void)((md_trace >= 3) && printk(x)))
+#define dprintk(x...) ((void)((md_trace >= 2) && printk(x)))
 
 /****************************************************************************/
 /* Module parameters, and other global data */
@@ -62,12 +61,12 @@ module_param(super, charp, 0);
 
 /* tunables */
 #define MD_NUM_STRIPES   1280
-#define MD_SYNC_WINDOW    384
-#define MD_SYNC_THRESH    (MD_SYNC_WINDOW/2)
+#define MD_QUEUE_LIMIT     80
+#define MD_SYNC_LIMIT       5
 
 int md_num_stripes        = MD_NUM_STRIPES;    /* total number of stripes possible */
-int md_sync_window        = MD_SYNC_WINDOW;    /* sync window size in stripes */
-int md_sync_thresh        = MD_SYNC_THRESH;    /* sync window threshold in stripes */
+int md_queue_limit        = MD_QUEUE_LIMIT;    /* percentage from 1..100 */
+int md_sync_limit         = MD_SYNC_LIMIT;     /* percentage from 1..100 */
 int md_write_method       = READ_MODIFY_WRITE; /* write algorithm */
 
 /* These are for start_array() NEW_ARRAY case to tell it which slots start out 'invalid'.
@@ -109,12 +108,14 @@ static int md_thread(void * arg)
 			flush_signals(current);
 
 		wait_event_interruptible(thread->wqueue,
-					 test_bit(THREAD_WAKEUP, &thread->flags) || kthread_should_stop());
+                                         test_bit(THREAD_WAKEUP, &thread->flags) ||
+                                         kthread_should_park() ||
+                                         kthread_should_stop());
 
-		if (test_bit(THREAD_WAKEUP, &thread->flags)) {
-			clear_bit(THREAD_WAKEUP, &thread->flags);
+                if (kthread_should_park())
+                        kthread_parkme();
+                if (test_and_clear_bit(THREAD_WAKEUP, &thread->flags))
 			thread->run(thread->mddev, thread->arg);
-		}
 	}
 
 	return 0;
@@ -159,7 +160,7 @@ void md_unregister_thread(mdk_thread_t *thread)
 void md_wakeup_thread(mdk_thread_t *thread)
 {
 	if (thread) {
-		dprintk("md: waking up MD-thread %s\n", thread->tsk->comm);
+//		dprintk("md: waking up MD-thread %s\n", thread->tsk->comm);
 		set_bit(THREAD_WAKEUP, &thread->flags);
 		wake_up(&thread->wqueue);
 	}
@@ -707,9 +708,6 @@ static mddev_t *alloc_mddev(dev_t dev)
 	/* setup */
 	mddev->dev = dev;
 
-	/* init spin lock for md request queues */
-	spin_lock_init(&mddev->queue_lock);
-
 	/* init recovery synchronization semaphore */
 	mutex_init(&mddev->recovery_sem);
 
@@ -1102,8 +1100,7 @@ static blk_qc_t md_make_request(struct request_queue *q, struct bio *bi)
         mdp_disk_t *disk = &mddev->sb.disks[unit];
         unsigned long spinup_group;
 
-        // not needed for now
-        // blk_queue_split(q, &bi, q->bio_split);
+        blk_queue_split(q, &bi);
 
         /* verify this unit is active */
         if (!disk_active(disk)) {
@@ -1130,6 +1127,8 @@ static blk_qc_t md_make_request(struct request_queue *q, struct bio *bi)
                 }
         }
 	
+        bi->bi_opf &= ~REQ_NOMERGE;
+
         return unraid_make_request(mddev, unit, bi);
 }
 
@@ -1183,15 +1182,16 @@ static int do_run(mddev_t *mddev)
 
                         /* alloc our block queue */
 			gd->queue = blk_alloc_queue(GFP_KERNEL);
-			gd->queue->queue_lock = &mddev->queue_lock;
 			gd->queue->queuedata = mddev;
 			blk_queue_make_request(gd->queue, md_make_request);
-                        blk_set_stacking_limits(&gd->queue->limits);
-			blk_queue_write_cache(gd->queue, true, true);
+                        blk_queue_io_min(gd->queue, PAGE_SIZE);
+                        blk_queue_io_opt(gd->queue, 128*1024);
                         gd->queue->backing_dev_info->ra_pages = (128*1024)/PAGE_SIZE;
 
-                        blk_queue_io_min(gd->queue, PAGE_SIZE);
-                        blk_queue_max_hw_sectors(gd->queue, 256);
+                        blk_set_stacking_limits(&gd->queue->limits);
+                        blk_queue_max_hw_sectors(gd->queue, 256);  /* 256 sectors => 128K */
+
+			blk_queue_write_cache(gd->queue, true, true);
                         blk_queue_max_write_same_sectors(gd->queue, 0);
                         blk_queue_max_write_zeroes_sectors(gd->queue, 0);
                         blk_queue_flag_clear(QUEUE_FLAG_DISCARD, gd->queue);
@@ -1268,8 +1268,7 @@ void md_sync_done(mddev_t *mddev, sector_t sector, int count)
 {
         /* another "count" sectors have been sync'ed */
         atomic_sub(count, &mddev->recovery_active);
-        if (atomic_read(&mddev->recovery_active) <= (md_sync_thresh * (PAGE_SIZE/512)))
-                wake_up(&mddev->recovery_wait);
+        wake_up(&mddev->recovery_wait);
 }
 
 /* SYNC_MARKS * SYNC_MARK_STEP is the number of past seconds that rate is calcuated over */
@@ -1278,14 +1277,11 @@ void md_sync_done(mddev_t *mddev, sector_t sector, int count)
 
 int md_do_sync(mddev_t *mddev)
 {
-	int window = 0;
 	unsigned long start_time, last_mark;
 	unsigned long mark[SYNC_MARKS];
 	unsigned long long mark_cnt[SYNC_MARKS];
 	int err = 0;
 	int i;
-
-        struct blk_plug plug;
 
 	start_time = jiffies;
 	for (i = 0; i < SYNC_MARKS; i++) {
@@ -1299,28 +1295,12 @@ int md_do_sync(mddev_t *mddev)
 	init_waitqueue_head(&mddev->recovery_wait);
 	atomic_set(&mddev->recovery_active, 0);
 
-        blk_start_plug(&plug);
-
 	while (mddev->curr_resync < mddev->recovery_running) {
-		sector_t sector = mddev->curr_resync;
-		int sectors;
-
-		/* check for change in window size */
-		if ((md_sync_window * (PAGE_SIZE/512)) != window) {
-			window = md_sync_window * (PAGE_SIZE/512); /* number of stripes (counted in sectors) */
-			printk("md: using %dk window, over a total of %llu blocks.\n",
-			       window/2, (mddev->recovery_running - mddev->curr_resync)/2);
-		}
-
-		/* issue request to sync one stripe's worth of sectors */
-		sectors = unraid_sync(mddev, sector);
+		int sectors = unraid_sync(mddev, mddev->curr_resync);
 
 		mddev->curr_resync += sectors;
 		atomic_add(sectors, &mddev->recovery_active);
-		
-		/* queue up 'window' number of sectors */
-		wait_event(mddev->recovery_wait, (atomic_read(&mddev->recovery_active) < window));
-	
+
 		if (jiffies >= mark[last_mark] + SYNC_MARK_STEP) {
                         unsigned long long prev_cnt = mark_cnt[last_mark];
 
@@ -1345,8 +1325,6 @@ int md_do_sync(mddev_t *mddev)
 			break;
 		}
 	}
-
-        blk_finish_plug(&plug);
 
 	wait_event(mddev->recovery_wait, (atomic_read(&mddev->recovery_active) == 0));
 	return err;
@@ -1702,36 +1680,47 @@ static int stop_array(dev_t array_dev, int notifier)
 static int check_array(dev_t array_dev, char *option)
 {
 	mddev_t *mddev = dev_to_mddev(array_dev);
+        int recovery_option, recovery_resume;
 
 	if (!mddev->private) {
 		printk("md: check_array: not started\n");
 		return -EINVAL;
 	}
 
-	/* check if recovery thread already active */
-	if (mddev->recovery_running) {
-		printk("md: check_array: recovery already active\n");
-		return -EINVAL;
-	}
-
 	/* process the option */
 	if (strcasecmp(option, "NOCORRECT") == 0) {
-		mddev->recovery_option = 0;
-                mddev->curr_resync = 0;
-                mddev->sb.sync_errs = 0;
+                recovery_option = 0;
+                recovery_resume = 0;
         }
 	else if (strcasecmp(option, "CORRECT") == 0) {
-		mddev->recovery_option = 1;
-                mddev->curr_resync = 0;
-                mddev->sb.sync_errs = 0;
+                recovery_option = 1;
+                recovery_resume = 0;
         }
-	else if ((strcasecmp(option, "RESUME") != 0) || (mddev->curr_resync == 0)) {
+	else if (strcasecmp(option, "RESUME") == 0) {
+                recovery_resume = 1;
+	}
+	else {
 		printk("md: check_array: invalid option: %s\n", option);
 		return -EINVAL;
 	}
 
-	/* kick the thread */
-	md_wakeup_thread(mddev->recovery_thread);
+        /* if recovery already running, just exit */
+        if (mddev->recovery_running)
+                return 0;
+
+        /* if resume indicated but not paused, just exit */
+        if (recovery_resume) {
+                if (mddev->curr_resync == 0)
+                        return 0;
+        }
+        else {
+		mddev->recovery_option = recovery_option;
+                mddev->curr_resync = 0;
+                mddev->sb.sync_errs = 0;
+        }
+
+        /* kick the thread */
+        md_wakeup_thread(mddev->recovery_thread);
 	return 0;
 }
 
@@ -1765,7 +1754,6 @@ static int nocheck_array(dev_t array_dev, char *option)
         if (!recovery_pause) {
                 mddev->curr_resync = 0;
         }
-
 	return 0;
 }
 
@@ -1851,9 +1839,9 @@ static int dump_array(dev_t array_dev)
 	mddev_t *mddev = dev_to_mddev(array_dev);
 
         printk("md_num_stripes=%d\n", md_num_stripes);
-        printk("md_sync_window=%d\n", md_sync_window);
-        printk("md_sync_thresh=%d\n", md_sync_thresh);
         printk("md_write_method=%d\n", md_write_method);
+        printk("md_queue_limit=%d\n", md_queue_limit);
+        printk("md_sync_limit=%d\n", md_sync_limit);
         printk("recovery_active=%d\n", atomic_read(&mddev->recovery_active)/(int)(PAGE_SIZE/512));
         
 	if (mddev->private)
@@ -2143,14 +2131,33 @@ static ssize_t md_proc_write(struct file *file, const char *buffer,
 		if (!strcmp("md_trace", name))
 			md_trace = token ? value : MD_TRACE;
 		else
-		if (!strcmp("md_num_stripes", name))
-			md_num_stripes = token ? value : MD_NUM_STRIPES;
+		if (!strcmp("md_num_stripes", name)) {
+			dev_t array_dev = MKDEV(MAJOR_NR,0);
+                        mddev_t *mddev = dev_to_mddev(array_dev);
+
+                        int num_stripes = token ? value : MD_NUM_STRIPES;
+
+                        if (mddev->private)
+                                md_num_stripes = unraid_num_stripes(mddev, num_stripes);
+                        else
+                                md_num_stripes = num_stripes;
+                }
 		else
-		if (!strcmp("md_sync_window", name))
-			md_sync_window = token ? value : MD_SYNC_WINDOW;
+		if (!strcmp("md_queue_limit", name)) {
+			md_queue_limit = token ? value : MD_QUEUE_LIMIT;
+                        if (md_queue_limit < 1)
+                                md_queue_limit = 1;
+                        else if (md_queue_limit > 100)
+                                md_queue_limit = 100;
+                }
 		else
-		if (!strcmp("md_sync_thresh", name))
-			md_sync_thresh = token ? value : MD_SYNC_THRESH;
+		if (!strcmp("md_sync_limit", name)) {
+			md_sync_limit = token ? value : MD_SYNC_LIMIT;
+                        if (md_sync_limit < 0)
+                                md_sync_limit = 0;
+                        else if (md_sync_limit > 100)
+                                md_sync_limit = 100;
+                }
 		else
                 if (!strcmp("md_write_method", name)) {
                         if (token) {
