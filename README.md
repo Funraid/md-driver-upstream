@@ -1,4 +1,4 @@
-# Unraid md-driver v2.9.4
+# Unraid md-driver v2.9.7
 
 ## Description
 This is the original source code for the md-driver developed by Lime Technology, Inc. for use in their [Unraid server](http://unraid.net). 
@@ -8,7 +8,10 @@ This version of the driver is used in the following releases of the [Unraid serv
 
 |Unraid version|Kernel release|
 |-|-|
-| **6.6.7** | linux-4.18.20-unRAID |
+| **6.7.0** | linux-4.19.41-Unraid |
+| **6.7.1-rc2** | linux-4.19.48-Unraid |
+| **6.7.2** | linux-4.19.56-Unraid |
+| **6.7.3-rc2** | linux-4.19.60-Unraid |
 
 
 # Disclaimer

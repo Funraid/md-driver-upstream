@@ -174,8 +174,7 @@ extern int md_write_method;     /* default write algorithm, refer to md_private.
 #define MD_BUFF_READ           10 /* want to read this buffer */
 #define MD_BUFF_WRITE          11 /* want to write this buffer */
 
-#define MD_BUFF_PARTIAL        12 /* only writing part of the buffer */
-#define MD_BUFF_IO_DONE        13 /* set when read/write completes */
+#define MD_BUFF_IO_DONE        12 /* set when read/write completes */
 
 #define buff_uptodate(d)        ((d)->state &   (1 << MD_BUFF_UPTODATE))
 #define set_buff_uptodate(d)    ((d)->state |=  (1 << MD_BUFF_UPTODATE))
@@ -185,17 +184,12 @@ extern int md_write_method;     /* default write algorithm, refer to md_private.
 #define set_buff_locked(d)      ((d)->state |=  (1 << MD_BUFF_LOCKED))
 #define clr_buff_locked(d)      ((d)->state &= ~(1 << MD_BUFF_LOCKED))
 
-#define partial_write(d)        ((d)->state &   (1 << MD_BUFF_PARTIAL))
-#define set_partial_write(d)    ((d)->state |=  (1 << MD_BUFF_PARTIAL))
-#define clr_partial_write(d)    ((d)->state &= ~(1 << MD_BUFF_PARTIAL))
-
 typedef struct column_s {
 	unsigned long           state;                  /* state flags */
 
 	struct bio	        *read_bi;	        /* read request buffers of the MD device */
 	struct bio	        *write_bi;	        /* write request buffers of the MD device */
 	struct bio	        *written_bi;            /* write request buffers of the MD device that have been scheduled for write */
-        int                     op_flags;               /* operation request flags */
 
 	struct bio	        bio;	                /* bio for cache buffer i/o */
 	struct bio_vec          vec;
@@ -441,24 +435,11 @@ static void add_stripe_bio(struct stripe_head *sh, struct bio *bi, int unit)
 	BUG_ON(col->read_bi);
 	BUG_ON(col->write_bi);
 	BUG_ON(col->written_bi);
-        BUG_ON(partial_write(col));
-        BUG_ON(col->op_flags);
 
-	if (bio_data_dir(bi) == READ) {
+	if (bio_data_dir(bi) == READ)
 		col->read_bi = bi;
-	}
-	else {
+	else
 		col->write_bi = bi;
-
-		/* check if partial write */
-		if (bi->bi_iter.bi_size &&
-		    ((bi->bi_iter.bi_sector > sh->sector) ||
-		     (bi->bi_iter.bi_sector+(bi->bi_iter.bi_size>>9) < sh->sector+(BUFFER_SECT))))
-			set_partial_write(col);
-
-                /* record write operation request flags */
-                col->op_flags = (bi->bi_opf & REQ_FUA) | (bi->bi_opf & REQ_SYNC);
-        }
 
 	spin_lock_irq(&conf->device_lock);
 	bi->bi_phys_segments++;
@@ -469,6 +450,15 @@ static void add_stripe_bio(struct stripe_head *sh, struct bio *bi, int unit)
 
 	dprintk("added bio b#%llu to stripe s#%llu, col %d\n",
 		(unsigned long long)bi->bi_iter.bi_sector, (unsigned long long)sh->sector, i);
+}
+
+static int partial_write(struct stripe_head *sh, column_t *col)
+{
+        struct bio *bi = col->write_bi;
+
+        return (bi->bi_iter.bi_size &&
+                ((bi->bi_iter.bi_sector > sh->sector) ||
+                 (bi->bi_iter.bi_sector+(bi->bi_iter.bi_size>>9) < sh->sector+(BUFFER_SECT))));
 }
 
 static void _release_stripe(unraid_conf_t *conf, struct stripe_head *sh)
@@ -563,7 +553,7 @@ static void copy_data(int frombio, struct bio *bio, char *pa, sector_t sector)
                         clen = len;
 
 		if (clen > 0) {
-			char *ba = kmap_atomic(bvl.bv_page) + bvl.bv_offset; /* ba += bvl.bv_offset in here */
+			char *ba = kmap_atomic(bvl.bv_page) + bvl.bv_offset;
 
 			if (frombio)
 				memcpy(pa+page_offset, ba+b_offset, clen);
@@ -969,30 +959,22 @@ static int schedule_writes(struct stripe_head *sh)
 {
 	int disks=sh->conf->disks;
         int _locked = 0;
-        int op_flags = 0;
         int i;
 
         for (i = 0; i < disks; i++) {
                 column_t *col = &sh->col[i];
 
                 if (buff_locked(col)) {
-                        /* ensure D op_flags set for P,Q as well */
-                        op_flags |= col->op_flags;
-
                         if (disk_enabled(col)) {
                                 dprintk("Writing col %d\n", i);
                                 _locked++;
                                 set_bit(MD_BUFF_WRITE, &col->state);
-                                col->op_flags = op_flags;
                         }
                         else {
                                 dprintk("Skip writing disabled col %d\n", i);
                                 clr_buff_locked(col);
                                 mark_disk_valid(col);
-                                col->op_flags = 0;
                         }
-
-                        clr_partial_write(col);
                 }
         }
 
@@ -1027,6 +1009,7 @@ static void handle_stripe(struct stripe_head *sh)
 	int locked=0, to_read=0, to_write=0, written=0;
 	int failed=0, faila=-1, failb=-1;
         int update_sb=0;
+        int pq_flags = 0;
 	struct bio *return_bi=NULL;
 
 	dprintk("handling stripe %llu, cnt=%d\n", (unsigned long long)sh->sector, atomic_read(&sh->count));
@@ -1344,7 +1327,7 @@ static void handle_stripe(struct stripe_head *sh)
                         /* read all data cols except target (unless partial write) */
                         for (i = 0; i < pd_idx; i++) {
                                 column_t *col = &sh->col[i];
-                                if ((!col->write_bi || partial_write(col)) &&
+                                if ((!col->write_bi || partial_write(sh, col)) &&
                                     !buff_uptodate(col) && !buff_locked(col)) {
                                         dprintk("Read_old col %d for Reconstruct write\n", i);
                                         locked += schedule_read(col, i);
@@ -1364,7 +1347,7 @@ static void handle_stripe(struct stripe_head *sh)
                                 /* read all data cols except target (unless partial write) */
                                 for (i = 0; i < pd_idx; i++) {
                                         column_t *col = &sh->col[i];
-                                        if ((!col->write_bi || partial_write(col)) &&
+                                        if ((!col->write_bi || partial_write(sh, col)) &&
                                             !buff_uptodate(col) && !buff_locked(col)) {
                                                 dprintk("Read_old col %d for Reconstruct write\n", i);
                                                 locked += schedule_read(col, i);
@@ -1381,12 +1364,12 @@ static void handle_stripe(struct stripe_head *sh)
                                 }
                         }
                         else
-                        if (faila < pd_idx && sh->col[faila].write_bi && !partial_write(&sh->col[faila])) {
+                        if (faila < pd_idx && sh->col[faila].write_bi && !partial_write(sh, &sh->col[faila])) {
                                 /* a target data disk failed */
                                 /* read all data cols except faila */
                                 for (i = 0; i < pd_idx; i++) {
                                         column_t *col = &sh->col[i];
-                                        if (i != faila && (!col->write_bi || partial_write(col)) &&
+                                        if (i != faila && (!col->write_bi || partial_write(sh, col)) &&
                                             !buff_uptodate(col) && !buff_locked(col)) {
                                                 dprintk("Read_old col %d for Reconstruct write\n", i);
                                                 locked += schedule_read(col, i);
@@ -1400,7 +1383,7 @@ static void handle_stripe(struct stripe_head *sh)
                                 }
                         }
                         else
-                        if (faila < pd_idx && (!sh->col[faila].write_bi || partial_write(&sh->col[faila]))) {
+                        if (faila < pd_idx && (!sh->col[faila].write_bi || partial_write(sh, &sh->col[faila]))) {
                                 /* some other data disk failed */
                                 /* read all cols except faila and Q (need to generate old-d) */
                                 for (i = 0; i < qd_idx; i++) {
@@ -1481,7 +1464,7 @@ static void handle_stripe(struct stripe_head *sh)
                         /* if partial write we need to read first */
                         for (i = 0; i < pd_idx; i++) {
                                 column_t *col = &sh->col[i];
-                                if ((col->write_bi && partial_write(col)) &&
+                                if ((col->write_bi && partial_write(sh, col)) &&
                                     !buff_uptodate(col) && !buff_locked(col)) {
                                         dprintk("Read_old col %d for partial write\n", i);
                                         locked += schedule_read(col, i);
@@ -1644,6 +1627,13 @@ static void handle_stripe(struct stripe_head *sh)
 		column_t *col = &sh->col[i];
 		struct bio *bi = &col->bio;
                 mdk_rdev_t *rdev = conf->rdev[i];
+                int op_flags = 0;
+
+                /* ensure D op_flags set for P,Q as well */
+                if (col->written_bi) {
+                        op_flags = (col->written_bi->bi_opf & REQ_FUA) | (col->written_bi->bi_opf & REQ_SYNC);
+                        pq_flags |= op_flags;
+                }
 
 		if (test_and_clear_bit(MD_BUFF_READ, &col->state)) {
                         bio_init(bi, &col->vec, 1);
@@ -1652,8 +1642,7 @@ static void handle_stripe(struct stripe_head *sh)
 		else
 		if (test_and_clear_bit(MD_BUFF_WRITE, &col->state)) {
                         bio_init(bi, &col->vec, 1);
-                        bi->bi_opf = REQ_OP_WRITE | col->op_flags;
-                        col->op_flags = 0;
+                        bi->bi_opf = REQ_OP_WRITE | ((i < pd_idx) ? op_flags : pq_flags);
                 }
 		else
 			continue;

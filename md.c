@@ -1186,6 +1186,7 @@ static int do_run(mddev_t *mddev)
 			gd->queue->queue_lock = &mddev->queue_lock;
 			gd->queue->queuedata = mddev;
 			blk_queue_make_request(gd->queue, md_make_request);
+                        blk_set_stacking_limits(&gd->queue->limits);
 			blk_queue_write_cache(gd->queue, true, true);
                         gd->queue->backing_dev_info->ra_pages = (128*1024)/PAGE_SIZE;
 
@@ -1282,15 +1283,13 @@ int md_do_sync(mddev_t *mddev)
 	start_time = jiffies;
 	for (i = 0; i < SYNC_MARKS; i++) {
 		mark[i] = start_time;
-		mark_cnt[i] = 0;
+		mark_cnt[i] = mddev->curr_resync;
 	}
 	last_mark = 0;
 	mddev->resync_mark = mark[last_mark];
 	mddev->resync_mark_cnt = mark_cnt[last_mark];
 
 	init_waitqueue_head(&mddev->recovery_wait);
-
-	mddev->curr_resync = md_resync_start;
 	atomic_set(&mddev->recovery_active, 0);
 
         blk_start_plug(&plug);
@@ -1333,7 +1332,7 @@ int md_do_sync(mddev_t *mddev)
 
 		if (signal_pending(current)) {
 			/* got a signal, exit */
-			printk("md: md_do_sync: got signal, exit...\n");
+			dprintk("md: md_do_sync: got signal, exit...\n");
 			flush_signals(current);
 			err = -EINTR;
 			break;
@@ -1343,13 +1342,6 @@ int md_do_sync(mddev_t *mddev)
         blk_finish_plug(&plug);
 
 	wait_event(mddev->recovery_wait, (atomic_read(&mddev->recovery_active) == 0));
-	mddev->curr_resync = 0;
-
-	if (err == 0) {
-		unsigned long duration = (jiffies - start_time) / HZ;
-		printk("md: sync done. time=%lusec\n", duration);
-	}
-
 	return err;
 }
 
@@ -1376,20 +1368,17 @@ static void md_do_recovery(mddev_t *mddev, unsigned long unused)
 		return;
 	}
         printk("md: recovery thread: %s ...\n", mddev->recovery_action);
-
-        /* record start time */
-        sb->stime = get_seconds();
-        sb->stime2 = 0;
-        sb->sync_errs = 0;
-        sb->sync_exit = 0;
+	mddev->recovery_running = mddev->recovery_size*2; /* count of sectors */
 
         /* record start of resync */
+        sb->stime = get_seconds();
+        sb->stime2 = 0;
+        sb->sync_exit = 0;
 	md_update_sb(mddev);
-
-	mddev->recovery_running = (md_resync_end ? md_resync_end : mddev->recovery_size*2); /* count of sectors */
 
 	sb->sync_exit = md_do_sync(mddev);
         sb->stime2 = get_seconds();
+
 	if (sb->sync_exit == 0) {
                 int i;
                         
@@ -1412,6 +1401,9 @@ static void md_do_recovery(mddev_t *mddev, unsigned long unused)
                                 rdev->status = DISK_OK;
                         }
                 }
+
+                mddev->curr_resync = 0;
+                printk("md: sync done. time=%usec\n", sb->stime2 - sb->stime);
 	}
 
 	/* record sync result */
@@ -1420,7 +1412,7 @@ static void md_do_recovery(mddev_t *mddev, unsigned long unused)
 	mddev->recovery_running = 0;
 	mutex_unlock(&mddev->recovery_sem);
 
-	printk("md: recovery thread: completion status: %d\n", sb->sync_exit);
+	printk("md: recovery thread: exit status: %d\n", sb->sync_exit);
 }
 
 /****************************************************************************/
@@ -1680,6 +1672,7 @@ static int stop_array(dev_t array_dev, int notifier)
 	md_interrupt_thread(mddev->recovery_thread);
 	mutex_lock(&mddev->recovery_sem);
 	mutex_unlock(&mddev->recovery_sem);
+        mddev->curr_resync = 0;
 
 	do_stop(mddev);
 	mddev->state = STOPPED;
@@ -1715,17 +1708,57 @@ static int check_array(dev_t array_dev, char *option)
 	}
 
 	/* process the option */
-	if (strcasecmp(option, "NOCORRECT") == 0)
+	if (strcasecmp(option, "NOCORRECT") == 0) {
 		mddev->recovery_option = 0;
-	else if (strcasecmp(option, "CORRECT") == 0)
+                mddev->curr_resync = 0;
+                mddev->sb.sync_errs = 0;
+        }
+	else if (strcasecmp(option, "CORRECT") == 0) {
 		mddev->recovery_option = 1;
-	else {
+                mddev->curr_resync = 0;
+                mddev->sb.sync_errs = 0;
+        }
+	else if ((strcasecmp(option, "RESUME") != 0) || (mddev->curr_resync == 0)) {
 		printk("md: check_array: invalid option: %s\n", option);
 		return -EINVAL;
 	}
 
 	/* kick the thread */
 	md_wakeup_thread(mddev->recovery_thread);
+	return 0;
+}
+
+/* Stop a running parity check operation.
+ */
+static int nocheck_array(dev_t array_dev, char *option)
+{
+	mddev_t *mddev = dev_to_mddev(array_dev);
+        int recovery_pause;
+
+	if (!mddev->private) {
+		printk("md: nocheck_array: not started\n");
+		return -EINVAL;
+	}
+
+	/* process the option */
+	if (strcasecmp(option, "CANCEL") == 0)
+		recovery_pause = 0;
+	else if (strcasecmp(option, "PAUSE") == 0)
+		recovery_pause = 1;
+	else {
+		printk("md: nocheck_array: invalid option: %s\n", option);
+		return -EINVAL;
+	}
+
+        /* stop the recovery thread */
+        md_interrupt_thread(mddev->recovery_thread);
+        mutex_lock(&mddev->recovery_sem);
+        mutex_unlock(&mddev->recovery_sem);
+
+        if (!recovery_pause) {
+                mddev->curr_resync = 0;
+        }
+
 	return 0;
 }
 
@@ -1748,31 +1781,6 @@ static int label_array(dev_t array_dev, char *label)
         memset(mddev->sb.label, 0, sizeof(mddev->sb.label));
         strcpy(mddev->sb.label, label);
 	md_update_sb(mddev);
-	return 0;
-}
-
-/* Stop a running parity check operation.
- */
-static int nocheck_array(dev_t array_dev)
-{
-	mddev_t *mddev = dev_to_mddev(array_dev);
-
-	if (!mddev->private) {
-		printk("md: nocheck_array: not started\n");
-		return -EINVAL;
-	}
-
-	/* check if recovery thread is indeed running */
-	if (!mddev->recovery_running) {
-		printk("md: nocheck_array: check not active\n");
-	}
-	else {
-		/* stop the recovery thread */
-		md_interrupt_thread(mddev->recovery_thread);
-		mutex_lock(&mddev->recovery_sem);
-		mutex_unlock(&mddev->recovery_sem);
-	}
-
 	return 0;
 }
 
@@ -1858,11 +1866,12 @@ static void status_sb(struct seq_file *seq, mdp_super_t *sb)
 	seq_printf(seq, "sbEvents=%d\n", sb->events);
 	seq_printf(seq, "sbState=%d\n", sb->state);
         seq_printf(seq, "sbNumDisks=%d\n", sb->num_disks);
-	seq_printf(seq, "sbSynced=%u\n", sb->stime);
-	seq_printf(seq, "sbSyncErrs=%u\n", sb->sync_errs);
-	seq_printf(seq, "sbSynced2=%u\n", sb->stime2);
-	seq_printf(seq, "sbSyncExit=%d\n", sb->sync_exit);
 	seq_printf(seq, "sbLabel=%s\n", sb->label);
+
+	seq_printf(seq, "sbSynced=%u\n", sb->stime);
+	seq_printf(seq, "sbSynced2=%u\n", sb->stime2);
+	seq_printf(seq, "sbSyncErrs=%u\n", sb->sync_errs);
+	seq_printf(seq, "sbSyncExit=%d\n", sb->sync_exit);
 }
 
 static void status_resync(mddev_t *mddev)
@@ -1986,7 +1995,7 @@ static void status_md(struct seq_file *seq, mddev_t *mddev)
 		seq_printf(seq, "mdResyncDb=%llu\n", db);
 	}
 	else {
-		seq_printf(seq, "mdResyncPos=0\n");
+		seq_printf(seq, "mdResyncPos=%llu\n", mddev->curr_resync/2);
 		seq_printf(seq, "mdResyncDt=0\n");
 		seq_printf(seq, "mdResyncDb=0\n");
         }
@@ -2260,8 +2269,12 @@ static ssize_t md_proc_write(struct file *file, const char *buffer,
 	else
 	if (!strcmp("nocheck", token)){
 		dev_t array_dev = MKDEV(MAJOR_NR,0);
+		char *option = "CANCEL";
+
+		if ((token = get_token(&bufp, delim)) != NULL)
+			option = token;
 		
-		result = nocheck_array(array_dev);
+		result = nocheck_array(array_dev, option);
 	}
 	else
 	if (!strcmp("label", token)){
