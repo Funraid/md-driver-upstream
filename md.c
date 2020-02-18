@@ -68,7 +68,7 @@ int md_num_stripes        = MD_NUM_STRIPES;    /* total number of stripes possib
 int md_queue_limit        = MD_QUEUE_LIMIT;    /* percentage from 1..100 */
 int md_sync_limit         = MD_SYNC_LIMIT;     /* percentage from 1..100 */
 int md_write_method       = READ_MODIFY_WRITE; /* write algorithm */
-int md_restrict           = 3; /* temp hack */
+int md_restrict           = 1; /* temp hack */
 
 /* These are for start_array() NEW_ARRAY case to tell it which slots start out 'invalid'.
  * Normally these identify the P and Q disk slots, but can be set to other slot numbers
@@ -2174,7 +2174,7 @@ static ssize_t md_proc_write(struct file *file, const char *buffer,
                 }
                 else
                 if (!strcmp("md_restrict", name)) {
-			md_restrict = token ? value : 3;
+			md_restrict = token ? value : 1;
                 }
                 else
 	        if (!strcmp("invalidslot", name)) {
