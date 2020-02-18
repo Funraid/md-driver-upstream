@@ -2014,9 +2014,6 @@ int unraid_run(mddev_t *mddev)
                 mdp_disk_t *disk = &mddev->sb.disks[i];
                 char name[16];
 
-                if (i && !disk_active(disk))
-                        continue;
-
                 INIT_LIST_HEAD(&conf->handle_list[i]);
 
                 sprintf( name, "unraidd%d", i);
