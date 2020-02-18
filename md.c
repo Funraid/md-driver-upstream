@@ -68,6 +68,7 @@ int md_num_stripes        = MD_NUM_STRIPES;    /* total number of stripes possib
 int md_queue_limit        = MD_QUEUE_LIMIT;    /* percentage from 1..100 */
 int md_sync_limit         = MD_SYNC_LIMIT;     /* percentage from 1..100 */
 int md_write_method       = READ_MODIFY_WRITE; /* write algorithm */
+int md_restrict           = 3; /* temp hack */
 
 /* These are for start_array() NEW_ARRAY case to tell it which slots start out 'invalid'.
  * Normally these identify the P and Q disk slots, but can be set to other slot numbers
@@ -1189,7 +1190,8 @@ static int do_run(mddev_t *mddev)
                         gd->queue->backing_dev_info->ra_pages = (128*1024)/PAGE_SIZE;
 
                         blk_set_stacking_limits(&gd->queue->limits);
-                        blk_queue_max_hw_sectors(gd->queue, 256);  /* 256 sectors => 128K */
+                        if (md_restrict & 1)
+                                blk_queue_max_hw_sectors(gd->queue, 256);  /* 256 sectors => 128K */
 
 			blk_queue_write_cache(gd->queue, true, true);
                         blk_queue_max_write_same_sectors(gd->queue, 0);
@@ -1842,6 +1844,7 @@ static int dump_array(dev_t array_dev)
         printk("md_write_method=%d\n", md_write_method);
         printk("md_queue_limit=%d\n", md_queue_limit);
         printk("md_sync_limit=%d\n", md_sync_limit);
+        printk("md_restrict=%d\n", md_restrict);
         printk("recovery_active=%d\n", atomic_read(&mddev->recovery_active)/(int)(PAGE_SIZE/512));
         
 	if (mddev->private)
@@ -2168,6 +2171,10 @@ static ssize_t md_proc_write(struct file *file, const char *buffer,
                         }
                         else
                                 md_write_method = READ_MODIFY_WRITE;
+                }
+                else
+                if (!strcmp("md_restrict", name)) {
+			md_restrict = token ? value : 3;
                 }
                 else
 	        if (!strcmp("invalidslot", name)) {

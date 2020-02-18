@@ -147,6 +147,7 @@ extern int md_num_stripes;      /* number of stripes to allocate */
 extern int md_write_method;     /* default write algorithm, refer to md_private.h */
 extern int md_queue_limit;      /* max queue depth ceiling as percentage [1..100] for I/O */
 extern int md_sync_limit;       /* max queue depth ceiling as percentage [1..100] for resync */
+extern int md_restrict;
 
 /* Buffer size in bytes */
 #define BUFFER_SIZE             PAGE_SIZE
@@ -174,7 +175,7 @@ extern int md_sync_limit;       /* max queue depth ceiling as percentage [1..100
 #define MD_BUFF_READ           10 /* want to read this buffer */
 #define MD_BUFF_WRITE          11 /* want to write this buffer */
 
-#define MD_BUFF_IO_DONE        12 /* set when read/write completes */
+#define MD_UPDATE_SB           12 /* set if superblock config change */
 
 #define buff_uptodate(d)        ((d)->state &   (1 << MD_BUFF_UPTODATE))
 #define set_buff_uptodate(d)    ((d)->state |=  (1 << MD_BUFF_UPTODATE))
@@ -403,28 +404,28 @@ static int _get_active_stripe(unraid_conf_t *conf, int unit, sector_t sector, in
                         else {
                                 /* no i/o pending, so either in handle list or inactive list */
                                 BUG_ON(list_empty(&sh->lru));
-                                if (!test_bit(STRIPE_HANDLE, &sh->state)) {
-                                        /* remove it from inactive list */
-                                        list_del_init(&sh->lru);
-                                }
-                                else {
+                                if (test_bit(STRIPE_HANDLE, &sh->state)) {
                                         /* still in handle list */
                                         sh = NULL;
+                                }
+                                else {
+                                        /* remove it from inactive list */
+                                        list_del_init(&sh->lru);
                                 }
                         }
                 }
 	}
 	if (sh) {
-                sh->unit = unit;
                 sanity_check(sh);
+                sh->unit = unit;
+                /* force read-modify-write if more than one active stream */
+                sh->write_method = (active == 1) ? md_write_method : READ_MODIFY_WRITE;
                 /* stripe is now active */
 		atomic_inc(&sh->count);
                 atomic_inc(&conf->active_stripes[unit]);
-                /* force read-modify-write if more than one active stream */
-                sh->write_method = (active == 1) ? md_write_method : READ_MODIFY_WRITE;
         }
         *shP = sh;
-        return (sh != NULL) || noblock;
+        return (sh || noblock);
 }
 
 static struct stripe_head *get_active_stripe(unraid_conf_t *conf, int unit, sector_t sector, int noblock)
@@ -434,13 +435,9 @@ static struct stripe_head *get_active_stripe(unraid_conf_t *conf, int unit, sect
 	dprintk("get_stripe, unit %i sector %llu\n", unit, (unsigned long long)sector);
 
 	spin_lock_irq(&conf->device_lock);
-	while (1) {
-                wait_event_lock_irq(conf->wait_for_stripe,
-                                    _get_active_stripe( conf, unit, sector, noblock, &sh),
-                                    conf->device_lock);
-                if (sh || noblock)
-                        break;
-        }
+        wait_event_lock_irq(conf->wait_for_stripe,
+                            _get_active_stripe( conf, unit, sector, noblock, &sh),
+                            conf->device_lock);
 	spin_unlock_irq(&conf->device_lock);
 
 	return sh;
@@ -455,7 +452,7 @@ static void add_stripe_bio(struct stripe_head *sh, struct bio *bi)
 	else
 		col->write_bi = bi;
 
-        bio_inc_remaining(bi);
+        bio_inc_remaining(bi); /* this is atomic */
 
 	dprintk("added bio b#%llu to stripe s#%llu, col %d\n",
 		(unsigned long long)bi->bi_iter.bi_sector, (unsigned long long)sh->sector, sh->unit);
@@ -484,10 +481,11 @@ static void _release_stripe(unraid_conf_t *conf, struct stripe_head *sh)
                         md_wakeup_thread(conf->thread[sh->unit]);
 		}
 		else {
-			list_add_tail(&sh->lru, &conf->inactive_list);
 			atomic_dec(&conf->active_stripes[sh->unit]);
 
+			list_add_tail(&sh->lru, &conf->inactive_list);
 			wake_up_all(&conf->wait_for_stripe);
+
 			dprintk("stripe %llu, released\n", (unsigned long long)sh->sector);
 		}
 	}
@@ -510,7 +508,7 @@ static void end_request(struct bio *bi)
 	unraid_conf_t *conf = sh->conf;
 
 	column_t *col = NULL;
-	int disks = conf->disks, i;
+	int disks = conf->disks, i, uptodate;
 
 	unsigned long flags;
 
@@ -520,10 +518,53 @@ static void end_request(struct bio *bi)
 		if (bi == &col->bio)
 			break;
 	}
-	BUG_ON(i == disks);
+        if (i == disks) {
+                bio_reset(bi);
+                BUG();
+                return;
+        }
+        BUG_ON(!buff_locked(col));
 
+        uptodate = !bi->bi_status;
+        if (bio_data_dir(bi) == READ) {
+                if (conf->rdev[i]->simulate_rderror) {
+                        conf->rdev[i]->simulate_rderror = 0;
+                        uptodate = 0;
+                }
+                if (uptodate) {
+                        set_buff_uptodate(col);
+                }
+                else {
+                        mdp_disk_t *disk = conf->disk[i];
+                        spin_lock_irqsave(&conf->device_lock, flags);
+                        md_read_error(conf->mddev, disk->number, sh->sector);
+                        spin_unlock_irqrestore(&conf->device_lock, flags);
+                        mark_disk_invalid(col);
+                }
+        }
+        else {
+                if (conf->rdev[i]->simulate_wrerror) {
+                        conf->rdev[i]->simulate_wrerror = 0;
+                        uptodate = 0;
+                }
+                if (uptodate) {
+                        mark_disk_valid(col);
+                }
+                else {
+                        mdp_disk_t *disk = conf->disk[i];
+                        spin_lock_irqsave(&conf->device_lock, flags);
+                        if (md_write_error(conf->mddev, disk->number, sh->sector))
+                                set_bit(MD_UPDATE_SB, &col->state);
+                        spin_unlock_irqrestore(&conf->device_lock, flags);
+                        mark_disk_disabled(col);
+                        if (disk_active(col))
+                                mark_disk_invalid(col);
+                }
+        }
+        bio_reset(bi);
+
+        clr_buff_locked(col);
 	spin_lock_irqsave(&conf->device_lock, flags);
-	set_bit(MD_BUFF_IO_DONE, &col->state);
         set_bit(STRIPE_HANDLE, &sh->state);
 	_release_stripe(conf, sh);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
@@ -781,7 +822,6 @@ void rmw5_write_data(struct stripe_head *sh)
                         BUG_ON(col->written_bi);
                         col->written_bi = col->write_bi;
                         col->write_bi = NULL;
-                        BUG_ON(col->write_bi);
                         break;
                 }
         }
@@ -1035,51 +1075,9 @@ static void handle_stripe(struct stripe_head *sh)
                         (unsigned long long)col->write_bi,
                         (unsigned long long)col->written_bi);
 
-		/* check for completed disk I/O */
-		if (test_and_clear_bit(MD_BUFF_IO_DONE, &col->state)) {
-			struct bio *bi = &col->bio;
-			int uptodate = !bi->bi_status;
-
-			BUG_ON(!buff_locked(col));
-
-			if (bio_data_dir(bi) == READ) {
-                                if (conf->rdev[i]->simulate_rderror) {
-                                        conf->rdev[i]->simulate_rderror = 0;
-                                        uptodate = 0;
-                                }
-				if (uptodate) {
-					set_buff_uptodate(col);
-                                }
-				else {
-                                        mdp_disk_t *disk = conf->disk[i];
-                                        spin_lock_irq(&conf->device_lock);
-                                        md_read_error(conf->mddev, disk->number, sh->sector);
-                                        spin_unlock_irq(&conf->device_lock);
-					mark_disk_invalid(col);
-				}
-			}
-			else {
-                                if (conf->rdev[i]->simulate_wrerror) {
-                                        conf->rdev[i]->simulate_wrerror = 0;
-                                        uptodate = 0;
-                                }
-				if (uptodate) {
-					mark_disk_valid(col);
-                                }
-				else {
-                                        mdp_disk_t *disk = conf->disk[i];
-                                        spin_lock_irq(&conf->device_lock);
-                                        if (md_write_error(conf->mddev, disk->number, sh->sector))
-                                                update_sb++;
-                                        spin_unlock_irq(&conf->device_lock);
-					mark_disk_disabled(col);
-                                        if (disk_active(col))
-                                                mark_disk_invalid(col);
-				}
-			}
-
-			clr_buff_locked(col);
-		}
+                /* check for config change requiring superblock update */
+                if (test_and_clear_bit(MD_UPDATE_SB, &col->state))
+                        update_sb++;
 
 		if (buff_locked(col)) locked++;
 
@@ -1094,7 +1092,7 @@ static void handle_stripe(struct stripe_head *sh)
                                 failb = i;
 		}
 	}
-        /* check for config change requiring superblock update */
+        /* check if we need to update the superblock */
         if (update_sb)
                 md_update_sb(conf->mddev);
 
@@ -1753,7 +1751,7 @@ blk_qc_t unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 	while (stripe_sector < last_sector) {
 		struct stripe_head *sh;
 
-		sh = get_active_stripe(conf, unit, stripe_sector, (bi->bi_opf & REQ_RAHEAD));
+		sh = get_active_stripe(conf, unit, stripe_sector, (bi->bi_opf & REQ_RAHEAD) && (md_restrict & 2));
 		if (sh) {
 			add_stripe_bio(sh, bi);
                         set_bit(STRIPE_HANDLE, &sh->state);
