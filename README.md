@@ -15,6 +15,8 @@ This version of the driver is used in the following releases of the [Unraid serv
 | **6.8.1-rc1** | linux-4.19.93-Unraid |
 | **6.8.1** | linux-4.19.94-Unraid |
 | **6.8.2** | linux-4.19.98-Unraid |
+| **6.8.3** | linux-4.19.107-Unraid |
+| **6.9.0-beta1** | linux-5.5.8-Unraid |
 
 
 # Disclaimer
